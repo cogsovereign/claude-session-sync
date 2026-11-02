@@ -440,30 +440,37 @@ def project_dir(cwd):
 
 
 def read_transcript(path):
-    """(first timestamp, last timestamp, last assistant uuid, set of row uuids)"""
-    first = last = asst = None
-    uuids = set()
+    """Transcript facts: first row time, first/last MESSAGE time (user and
+    assistant rows only; bookkeeping rows like frame-link or cost-state are
+    added whenever the app merely opens a chat), last assistant uuid, all row
+    uuids, and message uuid -> time."""
+    first_row = first_msg = last_msg = asst = None
+    uuids, msgs = set(), {}
     with open(path, encoding="utf-8") as f:
         for line in f:
             try:
                 r = json.loads(line)
             except ValueError:
                 continue
-            t = r.get("timestamp")
+            t, u, kind = r.get("timestamp"), r.get("uuid"), r.get("type")
             if t:
-                first = first or t
-                last = t
-            if r.get("uuid"):
-                uuids.add(r["uuid"])
-                if r.get("type") == "assistant":
-                    asst = r["uuid"]
-    return first, last, asst, uuids
+                first_row = first_row or t
+            if u:
+                uuids.add(u)
+            if kind in ("user", "assistant") and t:
+                first_msg = first_msg or t
+                last_msg = t
+                if u:
+                    msgs[u] = t
+                if kind == "assistant" and u:
+                    asst = u
+    return {"first_row": first_row, "first_msg": first_msg, "last_msg": last_msg,
+            "asst": asst, "uuids": uuids, "msgs": msgs}
 
 
 def iso_ms(t):
-    t = t.replace("Z", "+00:00")
     import datetime
-    return int(datetime.datetime.fromisoformat(t).timestamp() * 1000)
+    return int(datetime.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp() * 1000)
 
 
 def repair_plan(sc):
@@ -473,9 +480,11 @@ def repair_plan(sc):
     transcript (a new CLI session id) that replays the old rows and goes on
     from there, and it updates the chat entry to point at it. A stale entry
     copied over a fresh one points at the superseded transcript, so the chat
-    seems to end early. This finds the newest transcript of each chat's
-    conversation: one that starts right after the current one ends and
-    shares most of its rows."""
+    seems to end early. A continuation is a transcript in the same project
+    folder that no chat points at, shares at least half of the rows of the
+    smaller of the two, and has newer messages. If the current transcript
+    also has messages the continuation lacks (two branches), nothing is
+    changed and the chat is reported instead."""
     ent = {}
     for s in sc:
         for f in entries(s):
@@ -494,49 +503,71 @@ def repair_plan(sc):
             cache[path] = read_transcript(path)
         return cache[path]
 
-    plan = []
+    def superseded(pd, c, cand):
+        """True when a transcript some chat points at continues `cand`: then
+        `cand` is an older part of that chat, not a continuation of this one."""
+        for r in used:
+            rp = os.path.join(pd, (r or "") + ".jsonl")
+            if r == c or not r or not os.path.exists(rp):
+                continue
+            ri = info(rp)
+            if ri["last_msg"] and cand["last_msg"] and ri["last_msg"] > cand["last_msg"] and \
+                    len(ri["uuids"] & cand["uuids"]) >= max(1, min(len(ri["uuids"]), len(cand["uuids"])) // 2):
+                return True
+        return False
+
+    plan, diverged = [], []
     for k, e in ent.items():
         cwd, cid = e.get("cwd"), e.get("cliSessionId")
         pd = project_dir(cwd)
-        if not cid or not os.path.isdir(pd):
+        if not cid or not os.path.isdir(pd) or not os.path.exists(os.path.join(pd, cid + ".jsonl")):
             continue
-        cur = os.path.join(pd, cid + ".jsonl")
-        if not os.path.exists(cur):
-            continue
-        tip = cid
-        hops = 0
+        tip, hops, split = cid, 0, None
         while hops < 20:
-            first, last, asst, uu = info(os.path.join(pd, tip + ".jsonl"))
-            if not last:
+            cur = info(os.path.join(pd, tip + ".jsonl"))
+            if not cur["last_msg"]:
                 break
-            nxt = None
+            best = None
             for p in glob.glob(os.path.join(pd, "*.jsonl")):
                 c = os.path.basename(p)[:-6]
                 if c == tip or c in used or os.path.getsize(p) < 1000:
                     continue
-                f2, l2, a2, u2 = info(p)
-                if not f2 or f2 < last:
+                cand = info(p)
+                if not cand["last_msg"] or cand["last_msg"] <= cur["last_msg"]:
                     continue
-                if iso_ms(f2) - iso_ms(last) > 10 * 60 * 1000:   # starts within 10 min of the end
+                shared = len(cur["uuids"] & cand["uuids"])
+                if shared < max(1, min(len(cur["uuids"]), len(cand["uuids"])) // 2):
                     continue
-                if len(uu & u2) < min(len(uu), 50) // 2:          # and replays the conversation
+                if superseded(pd, c, cand):
                     continue
-                if nxt is None or f2 < nxt[0]:
-                    nxt = (f2, c)
-            if not nxt:
+                if best is None or cand["last_msg"] > best[1]["last_msg"]:
+                    best = (c, cand)
+            if not best:
                 break
-            tip = nxt[1]
-            hops += 1
-        first, last, asst, uu = info(os.path.join(pd, tip + ".jsonl"))
+            c, cand = best
+            # messages the current transcript got after the continuation began, missing from it
+            own = [t for u, t in cur["msgs"].items()
+                   if u not in cand["uuids"] and cand["first_row"] and t > cand["first_row"]]
+            if own:
+                split = (tip, c, len(own))
+                break
+            tip, hops = c, hops + 1
+        if split:
+            diverged.append((k, e.get("title", ""), split))
+            continue
+        t = info(os.path.join(pd, tip + ".jsonl"))
         want = {}
         if tip != cid:
             want["cliSessionId"] = tip
-        if last and iso_ms(last) > (e.get("lastActivityAt") or 0) + 60 * 1000:
-            want["lastActivityAt"] = want["lastTurnEdgeAt"] = iso_ms(last)
-            if asst:
-                want["lastAssistantUuid"] = want["postTurnSummaryFor"] = asst
+        if t["last_msg"] and (tip != cid or iso_ms(t["last_msg"]) > (e.get("lastActivityAt") or 0) + 60 * 1000):
+            want["lastActivityAt"] = want["lastTurnEdgeAt"] = iso_ms(t["last_msg"])
+            if t["asst"]:
+                want["lastAssistantUuid"] = want["postTurnSummaryFor"] = t["asst"]
         if want:
             plan.append((k, e.get("title", ""), cid, tip, want))
+    for k, title, (a, b, n) in diverged:
+        log(f"repair {k[:14]} '{title[:36]}': transcripts {a[:8]} and {b[:8]} both continue with their own messages "
+            f"({n} only in {a[:8]}); not changed. Open the one you want with: claude --resume <id>")
     return plan
 
 
