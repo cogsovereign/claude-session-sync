@@ -120,6 +120,26 @@ def open_app():
             log("open Claude yourself")
 
 
+
+def detach_for_quit(what):
+    """Quitting Claude kills a terminal that runs inside Claude, and the script
+    with it. So any command that quits the app re-runs itself as a detached
+    process that logs to the sync log, and this one just reports where to look."""
+    if DRY or "--detached" in sys.argv or not app_running():
+        return False
+    os.makedirs(DATA, exist_ok=True)
+    out = open(LOG, "a")
+    kw = {"stdout": out, "stderr": out, "stdin": subprocess.DEVNULL, "close_fds": True}
+    if SYSTEM == "Windows":
+        kw["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen([sys.executable, SELF] + sys.argv[1:] + ["--detached"], **kw)
+    print(f"{what}: Claude is closing; the work continues in the background and the app reopens by itself.")
+    print(f"Progress: {LOG}")
+    return True
+
+
 # ---------- chats ----------
 
 def scopes():
@@ -558,6 +578,8 @@ def repair(dry=False):
 
 def repair_cmd():
     restart = "restart" in sys.argv[2:]
+    if restart and detach_for_quit("repair"):
+        return
     if restart and app_running() and not DRY and not quit_app():
         sys.exit("Claude didn't quit; close it and run again.")
     if restart and not DRY:
@@ -574,6 +596,8 @@ def sync(restart=False):
     if not os.path.isdir(ROOT):
         sys.exit(f"No Claude Code sessions folder at {ROOT} — open the Code tab in the Claude app once first.")
     os.makedirs(DATA, exist_ok=True)
+    if restart and detach_for_quit("restart"):
+        return
     if restart and app_running() and not quit_app():
         sys.exit("Claude didn't quit; close it and run again.")
     sc = scopes()

@@ -60,6 +60,8 @@ python3 claude_session_sync.py repair restart     # quit Claude, relink, sync, r
 
 Copies of the entries before the repair go to `~/.claude-session-sync/backups/`.
 
+`restart` and `repair restart` can be run from any terminal, including the one inside the Claude app: they hand the work to a background process before quitting Claude, so quitting cannot cut them short. Progress goes to `~/.claude-session-sync/sync.log`.
+
 To stop the background sync (your chats and groups stay as they are):
 
 ```bash
