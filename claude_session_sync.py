@@ -27,8 +27,8 @@ group by the folder it was started in:
   python3 claude_session_sync.py group default General    everything else goes to "General"
   python3 claude_session_sync.py group list | remove <folder>
 The app keeps groups in memory while it runs, so groups are only written
-while the app is closed (the every-minute job catches that moment, or use
-`restart`).
+while the app is closed. The every-minute job keeps watching between runs,
+so it catches even a quick quit-and-reopen (or use `restart`).
 """
 import glob, json, os, platform, shutil, subprocess, sys, time, uuid
 
@@ -49,6 +49,8 @@ BACKUPS = os.path.join(DATA, "backups")
 LOG = os.path.join(DATA, "sync.log")
 TASK = "claude-session-sync"
 DRY = "--dry-run" in sys.argv
+WATCH = 55      # seconds each run keeps watching for the app to close
+SETTLE = 3      # seconds to wait after it closes before writing groups
 SELF = os.path.abspath(__file__)
 
 
@@ -397,12 +399,21 @@ def sync(restart=False):
     log("accounts:", len(sc), "| chats copied:", sync_chats(sc))
     if len(sc) < 2:
         log("only one account so far — sign in with another one, then run again")
-    if app_running():
-        log("groups: waiting for the app to close (or run `restart`)")
-    else:
-        log("groups changed:", sync_groups(sc, prefer))
     if restart:
+        time.sleep(SETTLE)
+        log("groups changed:", sync_groups(sc, prefer))
         open_app()
+        return
+    # A quit-and-reopen often takes less than a minute, so a once-a-minute
+    # check would miss it: watch for the close until the next run is due.
+    deadline = time.time() + WATCH
+    while app_running() and time.time() < deadline:
+        time.sleep(2)
+    if app_running():
+        log("groups: app still open, will catch the next close")
+    else:
+        time.sleep(SETTLE)   # let the app finish writing its settings on quit
+        log("groups changed:", sync_groups(sc, prefer))
 
 
 def status():
