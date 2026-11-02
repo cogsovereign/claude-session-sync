@@ -22,9 +22,9 @@ Chats: every chat entry is copied to every account folder; the newest wins.
 Groups: matched by name (case doesn't matter). A chat you move in any
 account moves everywhere. Optional folder rules file a chat that is in no
 group by the folder it was started in:
-  python3 claude_session_sync.py group ~/work/*  '*'      each folder under ~/work is a group named after it
-  python3 claude_session_sync.py group ~/notes Research   chats from ~/notes go to "Research"
-  python3 claude_session_sync.py group default General    everything else goes to "General"
+  python3 claude_session_sync.py group ~/work/*  '*'      each folder under ~/work is a group named like it
+  python3 claude_session_sync.py group ~/notes research   chats from ~/notes go to "research"
+  python3 claude_session_sync.py group default general    everything else goes to "general"
   python3 claude_session_sync.py group list | remove <folder>
 The app keeps groups in memory while it runs, so groups are only written
 while the app is closed. The every-minute job keeps watching between runs,
@@ -170,7 +170,8 @@ def sync_chats(sc):
 
 def load_rules():
     """{folder: group name, ..., "default": name}. A folder ending in /* means
-    every folder directly under it; a name of * means "named after the folder"."""
+    every folder directly under it; a name of * means "named like the folder",
+    spelled exactly as on disk. The rules' spelling wins over the accounts'."""
     if os.path.exists(RULES):
         return json.load(open(RULES))
     return {}
@@ -204,7 +205,7 @@ def rule_group(cwd, rules):
             if rel == ".":
                 continue
             child = rel.split(os.sep)[0]
-            got = child[:1].upper() + child[1:] if name == "*" else name
+            got = child if name == "*" else name
         else:
             got = name
         if best is None or len(base) > len(best[0]):
@@ -272,7 +273,10 @@ def sync_groups(sc, prefer):
     # account in use is applied last, so its groups win.
     state = load_state()
     prefer = state.get("prefer") or prefer
-    canon = Names([v for k, v in rules.items() if v != "*"] + list(state["names"]))
+    folders = chat_folders(sc) if rules else {}
+    canon = Names([v for k, v in rules.items() if v != "*"]
+                  + [g for g in (rule_group(c, rules) for c in folders.values()) if g]
+                  + list(state["names"]))
     names = [canon(n) for n in state["names"]]
     assign = {k: canon(v) for k, v in state["assign"].items()}
     was = {k: canon(v) for k, v in state["assign"].items()}
@@ -295,7 +299,7 @@ def sync_groups(sc, prefer):
 
     # Folder rules: a chat in no group is filed by the folder it started in.
     if rules:
-        for sid, cwd in chat_folders(sc).items():
+        for sid, cwd in folders.items():
             key = "code:" + sid
             if key in assign:
                 continue
@@ -369,7 +373,7 @@ def group_cmd():
     rules = load_rules()
     if not args or args[0] == "list":
         if not rules:
-            print("no folder rules. Example: group ~/work/* '*'   (each folder under ~/work is its own group)")
+            print("no folder rules. Example: group ~/work/* '*'   (each folder under ~/work is a group named like it)")
         for k, v in rules.items():
             print(f"  {k:30} -> {v}")
         return
