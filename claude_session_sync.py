@@ -14,16 +14,23 @@ settings are kept in the state folder.
   python3 claude_session_sync.py restart     quit the app, sync all, reopen it
   python3 claude_session_sync.py install     run the sync every minute
   python3 claude_session_sync.py uninstall   stop running it
-  python3 claude_session_sync.py status      show accounts, chats and groups
+  python3 claude_session_sync.py status      show accounts, chats, groups and rules
+  python3 claude_session_sync.py group ...   file chats into groups by folder (see below)
   add --dry-run to any command to see what it would do without doing it.
 
 Chats: every chat entry is copied to every account folder; the newest wins.
-Groups: matched by name. A chat you move in any account moves everywhere.
+Groups: matched by name (case doesn't matter). A chat you move in any
+account moves everywhere. Optional folder rules file a chat that is in no
+group by the folder it was started in:
+  python3 claude_session_sync.py group ~/work/*  '*'      each folder under ~/work is a group named after it
+  python3 claude_session_sync.py group ~/notes Research   chats from ~/notes go to "Research"
+  python3 claude_session_sync.py group default General    everything else goes to "General"
+  python3 claude_session_sync.py group list | remove <folder>
 The app keeps groups in memory while it runs, so groups are only written
 while the app is closed (the every-minute job catches that moment, or use
 `restart`).
 """
-import glob, json, os, platform, shutil, subprocess, sys, time
+import glob, json, os, platform, shutil, subprocess, sys, time, uuid
 
 SYSTEM = platform.system()          # Darwin | Windows | Linux
 HOME = os.path.expanduser("~")
@@ -37,6 +44,7 @@ ROOT = os.path.join(APP, "claude-code-sessions")
 CONFIG = os.path.join(APP, "claude_desktop_config.json")
 DATA = os.path.join(HOME, ".claude-session-sync")
 STATE = os.path.join(DATA, "state.json")
+RULES = os.path.join(DATA, "groups.json")
 BACKUPS = os.path.join(DATA, "backups")
 LOG = os.path.join(DATA, "sync.log")
 TASK = "claude-session-sync"
@@ -158,9 +166,66 @@ def sync_chats(sc):
 
 # ---------- groups ----------
 
-def by_name(g):
-    idname = {x["id"]: x["name"] for x in g.get("groups", [])}
-    return ([x["name"] for x in g.get("groups", [])],
+def load_rules():
+    """{folder: group name, ..., "default": name}. A folder ending in /* means
+    every folder directly under it; a name of * means "named after the folder"."""
+    if os.path.exists(RULES):
+        return json.load(open(RULES))
+    return {}
+
+
+def save_rules(r):
+    os.makedirs(DATA, exist_ok=True)
+    json.dump(r, open(RULES, "w"), indent=1)
+
+
+def norm_path(p):
+    p = os.path.normpath(os.path.expanduser(p))
+    return os.path.normcase(p) if SYSTEM == "Windows" else p
+
+
+def rule_group(cwd, rules):
+    """Group name a chat started in cwd belongs to by the rules, or None."""
+    if not cwd:
+        return None
+    cwd = norm_path(cwd)
+    best = None
+    for folder, name in rules.items():
+        if folder == "default":
+            continue
+        star = folder.endswith("/*") or folder.endswith(os.sep + "*")
+        base = norm_path(folder[:-2]) if star else norm_path(folder)
+        rel = os.path.relpath(cwd, base)
+        if rel.startswith(".."):
+            continue
+        if star:
+            if rel == ".":
+                continue
+            child = rel.split(os.sep)[0]
+            got = child[:1].upper() + child[1:] if name == "*" else name
+        else:
+            got = name
+        if best is None or len(base) > len(best[0]):
+            best = (base, got)
+    if best:
+        return best[1]
+    return rules.get("default") or None
+
+
+class Names:
+    """Group names compared without case; the first spelling seen is kept."""
+    def __init__(self, prefer=()):
+        self.canon = {}
+        for n in prefer:
+            self.canon.setdefault(n.casefold(), n)
+
+    def __call__(self, name):
+        return self.canon.setdefault(name.casefold(), name)
+
+
+def by_name(g, canon):
+    idname = {x["id"]: canon(x["name"]) for x in g.get("groups", [])}
+    return (list(dict.fromkeys(idname.values())),
             {k: idname[v] for k, v in g.get("assignments", {}).items() if v in idname})
 
 
@@ -168,6 +233,26 @@ def load_state():
     if os.path.exists(STATE):
         return json.load(open(STATE))
     return {"names": [], "assign": {}, "ids": {}, "seen": [], "prefer": None}
+
+
+def chat_folders(sc):
+    """sessionId -> folder each chat was started in (newest entry wins)."""
+    newest = {}
+    for s in sc:
+        for f in entries(s):
+            m = os.path.getmtime(f)
+            name = os.path.basename(f)
+            if name not in newest or m > newest[name][0]:
+                newest[name] = (m, f)
+    out = {}
+    for m, f in newest.values():
+        try:
+            e = json.load(open(f, encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        sid = e.get("sessionId") or os.path.basename(f)[:-5]
+        out[sid] = e.get("cwd") or e.get("originCwd")
+    return out
 
 
 def sync_groups(sc, prefer):
@@ -178,15 +263,19 @@ def sync_groups(sc, prefer):
     prefs = cfg.setdefault("preferences", {}).setdefault("epitaxyPrefs", {})
     gs = prefs.setdefault("dframe-group-scopes", {})
     secs = prefs.setdefault("dframe-code-sections", {})
+    rules = load_rules()
 
     # Start from the last merged result and apply what each account changed
     # since then, so a move made in any account wins. On the first run the
     # account in use is applied last, so its groups win.
     state = load_state()
     prefer = state.get("prefer") or prefer
-    names, assign = list(state["names"]), dict(state["assign"])
+    canon = Names([v for k, v in rules.items() if v != "*"] + list(state["names"]))
+    names = [canon(n) for n in state["names"]]
+    assign = {k: canon(v) for k, v in state["assign"].items()}
+    was = {k: canon(v) for k, v in state["assign"].items()}
     for s in sorted(sc, key=lambda s: s == prefer):
-        n, a = by_name(gs.get(s, {}))
+        n, a = by_name(gs.get(s, {}), canon)
         seen = s in state["seen"]
         for name in names[:]:
             if seen and name not in n:          # group deleted in this account
@@ -194,13 +283,26 @@ def sync_groups(sc, prefer):
         for name in n:
             if name not in names:
                 names.append(name)
-        for k in set(a) | (set(state["assign"]) if seen else set()):
-            if a.get(k) != state["assign"].get(k):   # moved in this account
+        for k in set(a) | (set(was) if seen else set()):
+            if a.get(k) != was.get(k):   # moved in this account
                 if a.get(k) is None:
                     assign.pop(k, None)
                 else:
                     assign[k] = a[k]
     assign = {k: v for k, v in assign.items() if v in names}
+
+    # Folder rules: a chat in no group is filed by the folder it started in.
+    if rules:
+        for sid, cwd in chat_folders(sc).items():
+            key = "code:" + sid
+            if key in assign:
+                continue
+            g = rule_group(cwd, rules)
+            if g:
+                g = canon(g)
+                assign[key] = g
+                if g not in names:
+                    names.append(g)
     if not names:
         log("groups: none yet")
         return 0
@@ -209,8 +311,10 @@ def sync_groups(sc, prefer):
     ids = {n: state["ids"][n] for n in names if n in state["ids"]}
     for s in sorted(sc, key=lambda s: s != prefer):
         for x in gs.get(s, {}).get("groups", []):
-            if x["name"] in names:
-                ids.setdefault(x["name"], x["id"])
+            if canon(x["name"]) in names:
+                ids.setdefault(canon(x["name"]), x["id"])
+    for n in names:
+        ids.setdefault(n, "cg-" + str(uuid.uuid4()))   # a group that exists only in the rules yet
 
     changed = 0
     for s in sc:
@@ -257,6 +361,29 @@ def sync_groups(sc, prefer):
     return changed
 
 
+def group_cmd():
+    """group list | group <folder> <name> | group default <name> | group remove <folder>"""
+    args = [a for a in sys.argv[2:] if not a.startswith("--")]
+    rules = load_rules()
+    if not args or args[0] == "list":
+        if not rules:
+            print("no folder rules. Example: group ~/work/* '*'   (each folder under ~/work is its own group)")
+        for k, v in rules.items():
+            print(f"  {k:30} -> {v}")
+        return
+    if args[0] == "remove" and len(args) == 2:
+        rules.pop(args[1], None)
+    elif len(args) == 2:
+        rules[args[0]] = args[1]
+    else:
+        sys.exit(group_cmd.__doc__)
+    if DRY:
+        log("would write", RULES, rules)
+        return
+    save_rules(rules)
+    log("rules:", rules, "| applied the next time the app is closed (or run `restart`)")
+
+
 # ---------- commands ----------
 
 def sync(restart=False):
@@ -287,10 +414,12 @@ def status():
     if os.path.exists(CONFIG):
         gs = json.load(open(CONFIG, encoding="utf-8")).get("preferences", {}) \
             .get("epitaxyPrefs", {}).get("dframe-group-scopes", {})
+        canon = Names()
         for s in sc:
-            n, a = by_name(gs.get(s, {}))
+            n, a = by_name(gs.get(s, {}), canon)
             print(f"  groups in {s[:8]}/{s.split('/')[1][:8]}:",
                   {g: sum(1 for v in a.values() if v == g) for g in n} or "none")
+    print("folder rules:", load_rules() or "none (see `group`)")
     print("scheduled:", scheduled())
 
 
@@ -387,4 +516,4 @@ def scheduled():
 if __name__ == "__main__":
     cmd = next((a for a in sys.argv[1:] if not a.startswith("-")), "sync")
     {"sync": sync, "restart": lambda: sync(restart=True), "install": install,
-     "uninstall": uninstall, "status": status}.get(cmd, lambda: sys.exit(__doc__))()
+     "uninstall": uninstall, "status": status, "group": group_cmd}.get(cmd, lambda: sys.exit(__doc__))()

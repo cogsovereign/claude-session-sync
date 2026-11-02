@@ -9,7 +9,8 @@ The Claude desktop app keeps a separate chat list for each account and org. If y
 ## What this does
 
 - **Chats:** copies every chat entry into every account's list. When the same chat differs between accounts, the newest version wins.
-- **Groups:** matches groups by **name**. A chat you move into a group in any account moves there in all of them. On the first run, the account you're using now wins.
+- **Groups:** matches groups by **name** (case doesn't matter, so "pawy" and "Pawy" are one group). A chat you move into a group in any account moves there in all of them. On the first run, the account you're using now wins.
+- **Folder rules (optional):** file every chat that is in no group into a group chosen by the folder it was started in, so the sidebar shows one set of groups instead of groups mixed with folder headings. See *Folder rules* below.
 - **Safe:** it only copies. It never deletes and never uses symlinks (symlinked folders silently stop the app from saving new chats). Before each change it backs up the app's settings to `~/.claude-session-sync/backups/` and keeps the last 20.
 
 The app keeps groups in memory while it's open. So group changes are written only while the app is **closed**. Chats sync while it's open.
@@ -33,6 +34,20 @@ When you switch accounts, run this. It closes Claude, syncs chats and groups, an
 ```bash
 python3 claude_session_sync.py restart
 ```
+
+### Folder rules
+
+The default sidebar shows ungrouped chats under the folder they were started in. If you also made a group with the same name, you see the folder (`pawy`) and the group (`Pawy`) side by side. Rules fix that: a chat in no group is filed by its folder, in every account.
+
+```bash
+python3 claude_session_sync.py group '~/work/*' '*'       # each folder under ~/work is its own group, named after it (pawy → Pawy)
+python3 claude_session_sync.py group ~/notes Research      # chats started in ~/notes go to "Research"
+python3 claude_session_sync.py group default General       # every other chat goes to "General"
+python3 claude_session_sync.py group list
+python3 claude_session_sync.py group remove '~/work/*'
+```
+
+The most specific folder wins. A chat you moved into a group by hand keeps that group; rules only place chats that are in none. Rules are applied together with the groups, so while the app is open they take effect the next time it closes (or on `restart`). They live in `~/.claude-session-sync/groups.json`.
 
 To stop the background sync (your chats and groups stay as they are):
 
