@@ -16,9 +16,13 @@ settings are kept in the state folder.
   python3 claude_session_sync.py uninstall   stop running it
   python3 claude_session_sync.py status      show accounts, chats, groups and rules
   python3 claude_session_sync.py group ...   file chats into groups by folder (see below)
+  python3 claude_session_sync.py repair      point every chat at the newest transcript of its
+                                             conversation (add `restart` to quit/reopen the app)
   add --dry-run to any command to see what it would do without doing it.
 
-Chats: every chat entry is copied to every account folder; the newest wins.
+Chats: every chat entry is copied to every account folder; the copy whose
+conversation is newest wins (judged by the activity time inside the file,
+never by file time alone: the app rewrites an entry it merely shows).
 Groups: matched by name (case doesn't matter). A chat you move in any
 account moves everywhere. Optional folder rules file a chat that is in no
 group by the folder it was started in:
@@ -146,19 +150,34 @@ def copy_atomic(src, dst):
     os.replace(tmp, dst)
 
 
+def freshness(path):
+    """How recent a chat entry is: the conversation's own last-activity time
+    inside the file first, the file time only as a tie-breaker. The app
+    rewrites an entry it merely shows (e.g. on focus), so file time alone
+    would let a stale copy overwrite a newer one."""
+    m = os.path.getmtime(path)
+    if not os.path.basename(path).startswith("local_"):
+        return (0, m)
+    try:
+        e = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return (0, m)
+    return (max(e.get("lastActivityAt") or 0, e.get("lastTurnEdgeAt") or 0), m)
+
+
 def sync_chats(sc):
-    newest = {}  # file name -> (mtime, path)
+    newest = {}  # file name -> (freshness, path)
     for s in sc:
         d = os.path.join(ROOT, *s.split("/"))
         for f in entries(s) + glob.glob(os.path.join(d, "archived-sessions.idx")):
-            name, m = os.path.basename(f), os.path.getmtime(f)
-            if name not in newest or m > newest[name][0]:
-                newest[name] = (m, f)
+            name, k = os.path.basename(f), freshness(f)
+            if name not in newest or k > newest[name][0]:
+                newest[name] = (k, f)
     n = 0
-    for name, (m, src) in newest.items():
+    for name, (k, src) in newest.items():
         for s in sc:
             dst = os.path.join(ROOT, *s.split("/"), name)
-            if dst == src or (os.path.exists(dst) and os.path.getmtime(dst) >= m):
+            if dst == src or (os.path.exists(dst) and freshness(dst) >= k):
                 continue
             log("chat", "update" if os.path.exists(dst) else "add", name, "->", s[:8])
             copy_atomic(src, dst)
@@ -390,6 +409,165 @@ def group_cmd():
     log("rules:", rules, "| applied the next time the app is closed (or run `restart`)")
 
 
+
+# ---------- repair ----------
+
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+
+
+def project_dir(cwd):
+    return os.path.join(PROJECTS, cwd.replace(os.sep, "-").replace(":", "-") if cwd else "")
+
+
+def read_transcript(path):
+    """(first timestamp, last timestamp, last assistant uuid, set of row uuids)"""
+    first = last = asst = None
+    uuids = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            t = r.get("timestamp")
+            if t:
+                first = first or t
+                last = t
+            if r.get("uuid"):
+                uuids.add(r["uuid"])
+                if r.get("type") == "assistant":
+                    asst = r["uuid"]
+    return first, last, asst, uuids
+
+
+def iso_ms(t):
+    t = t.replace("Z", "+00:00")
+    import datetime
+    return int(datetime.datetime.fromisoformat(t).timestamp() * 1000)
+
+
+def repair_plan(sc):
+    """For every chat, follow its transcript to the newest continuation.
+
+    When the app resumes a chat it may continue the conversation in a new
+    transcript (a new CLI session id) that replays the old rows and goes on
+    from there, and it updates the chat entry to point at it. A stale entry
+    copied over a fresh one points at the superseded transcript, so the chat
+    seems to end early. This finds the newest transcript of each chat's
+    conversation: one that starts right after the current one ends and
+    shares most of its rows."""
+    ent = {}
+    for s in sc:
+        for f in entries(s):
+            try:
+                e = json.load(open(f, encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            k = e.get("sessionId") or os.path.basename(f)[:-5]
+            if k not in ent or (e.get("lastActivityAt") or 0) > (ent[k].get("lastActivityAt") or 0):
+                ent[k] = e
+    used = {e.get("cliSessionId") for e in ent.values()}
+    cache = {}
+
+    def info(path):
+        if path not in cache:
+            cache[path] = read_transcript(path)
+        return cache[path]
+
+    plan = []
+    for k, e in ent.items():
+        cwd, cid = e.get("cwd"), e.get("cliSessionId")
+        pd = project_dir(cwd)
+        if not cid or not os.path.isdir(pd):
+            continue
+        cur = os.path.join(pd, cid + ".jsonl")
+        if not os.path.exists(cur):
+            continue
+        tip = cid
+        hops = 0
+        while hops < 20:
+            first, last, asst, uu = info(os.path.join(pd, tip + ".jsonl"))
+            if not last:
+                break
+            nxt = None
+            for p in glob.glob(os.path.join(pd, "*.jsonl")):
+                c = os.path.basename(p)[:-6]
+                if c == tip or c in used or os.path.getsize(p) < 1000:
+                    continue
+                f2, l2, a2, u2 = info(p)
+                if not f2 or f2 < last:
+                    continue
+                if iso_ms(f2) - iso_ms(last) > 10 * 60 * 1000:   # starts within 10 min of the end
+                    continue
+                if len(uu & u2) < min(len(uu), 50) // 2:          # and replays the conversation
+                    continue
+                if nxt is None or f2 < nxt[0]:
+                    nxt = (f2, c)
+            if not nxt:
+                break
+            tip = nxt[1]
+            hops += 1
+        first, last, asst, uu = info(os.path.join(pd, tip + ".jsonl"))
+        want = {}
+        if tip != cid:
+            want["cliSessionId"] = tip
+        if last and iso_ms(last) > (e.get("lastActivityAt") or 0) + 60 * 1000:
+            want["lastActivityAt"] = want["lastTurnEdgeAt"] = iso_ms(last)
+            if asst:
+                want["lastAssistantUuid"] = want["postTurnSummaryFor"] = asst
+        if want:
+            plan.append((k, e.get("title", ""), cid, tip, want))
+    return plan
+
+
+def repair(dry=False):
+    if not os.path.isdir(ROOT):
+        sys.exit(f"No Claude Code sessions folder at {ROOT}.")
+    sc = scopes()
+    plan = repair_plan(sc)
+    if not plan:
+        log("repair: every chat already points at its newest transcript")
+        return 0
+    import datetime
+    for k, title, cid, tip, want in plan:
+        la = want.get("lastActivityAt")
+        when = datetime.datetime.fromtimestamp(la / 1000).strftime("%Y-%m-%d %H:%M") if la else "-"
+        log(f"repair {k[:14]} '{title[:36]}': transcript {cid[:8]} -> {tip[:8]}, last activity {when}")
+    if dry or DRY:
+        return len(plan)
+    if app_running():
+        sys.exit("Quit Claude first (the app would overwrite the repaired entries), or run `repair restart`.")
+    os.makedirs(BACKUPS, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    n = 0
+    for k, title, cid, tip, want in plan:
+        for s in sc:
+            f = os.path.join(ROOT, *s.split("/"), k + ".json")
+            if not os.path.exists(f):
+                continue
+            shutil.copy2(f, os.path.join(BACKUPS, f"{stamp}-{s.replace('/', '_')}-{k}.json"))
+            e = json.load(open(f, encoding="utf-8"))
+            e.update(want)
+            tmp = f + ".sync-tmp"
+            json.dump(e, open(tmp, "w", encoding="utf-8"), indent=2)
+            os.replace(tmp, f)
+            n += 1
+    log(f"repaired {len(plan)} chats in {len(sc)} accounts ({n} files); copies of the old entries in {BACKUPS}")
+    return len(plan)
+
+
+def repair_cmd():
+    restart = "restart" in sys.argv[2:]
+    if restart and app_running() and not DRY and not quit_app():
+        sys.exit("Claude didn't quit; close it and run again.")
+    if restart and not DRY:
+        time.sleep(SETTLE)
+    repair()
+    if restart and not DRY:
+        sync()
+        open_app()
+
+
 # ---------- commands ----------
 
 def sync(restart=False):
@@ -531,4 +709,4 @@ def scheduled():
 if __name__ == "__main__":
     cmd = next((a for a in sys.argv[1:] if not a.startswith("-")), "sync")
     {"sync": sync, "restart": lambda: sync(restart=True), "install": install,
-     "uninstall": uninstall, "status": status, "group": group_cmd}.get(cmd, lambda: sys.exit(__doc__))()
+     "uninstall": uninstall, "status": status, "group": group_cmd, "repair": repair_cmd}.get(cmd, lambda: sys.exit(__doc__))()

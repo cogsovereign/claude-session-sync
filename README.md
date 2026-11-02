@@ -8,7 +8,7 @@ The Claude desktop app keeps a separate chat list for each account and org. If y
 
 ## What this does
 
-- **Chats:** copies every chat entry into every account's list. When the same chat differs between accounts, the newest version wins.
+- **Chats:** copies every chat entry into every account's list. When the same chat differs between accounts, the one whose conversation is newest wins (judged by the last-activity time stored inside the entry, never by file time alone: the app rewrites an entry just for showing it).
 - **Groups:** matches groups by **name** (case doesn't matter, so "pawy" and "Pawy" are one group; with folder rules, the rule's spelling is used everywhere). A chat you move into a group in any account moves there in all of them. On the first run, the account you're using now wins.
 - **Folder rules (optional):** file every chat that is in no group into a group chosen by the folder it was started in, so the sidebar shows one set of groups instead of groups mixed with folder headings. See *Folder rules* below.
 - **Safe:** it only copies. It never deletes and never uses symlinks (symlinked folders silently stop the app from saving new chats). Before each change it backs up the app's settings to `~/.claude-session-sync/backups/` and keeps the last 20.
@@ -48,6 +48,17 @@ python3 claude_session_sync.py group remove '~/work/*'
 ```
 
 The most specific folder wins. Group names come from the rules, spelled exactly as you wrote them (or as the folder is spelled on disk), so an existing "Pawy" group becomes "pawy" when the rule says so. A chat you moved into a group by hand keeps that group; rules only place chats that are in none. Rules are applied together with the groups, so while the app is open they take effect the next time it closes (or on `restart`). They live in `~/.claude-session-sync/groups.json`.
+
+### If a chat seems to end early
+
+When the app resumes a chat it can continue the conversation in a new transcript and point the chat at it. If an older copy of the chat entry ever won a sync (versions before November 2026 judged by file time), the chat points at the superseded transcript and seems to stop at an earlier message. Nothing is lost: `repair` follows each chat's conversation to its newest transcript and points the chat there, in every account.
+
+```bash
+python3 claude_session_sync.py repair --dry-run   # show what it would relink
+python3 claude_session_sync.py repair restart     # quit Claude, relink, sync, reopen
+```
+
+Copies of the entries before the repair go to `~/.claude-session-sync/backups/`.
 
 To stop the background sync (your chats and groups stay as they are):
 
